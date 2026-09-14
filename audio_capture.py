@@ -1,6 +1,8 @@
 """Microphone capture for WASAPI devices with non-extensible mix formats."""
 import contextlib
 import os
+import multiprocessing
+import time
 import warnings
 
 
@@ -64,7 +66,12 @@ class MicrophoneRecorder:
             channels=min(self.microphone.channels, info['max_input_channels']),
             dtype='float32', blocksize=0, latency='low',
             extra_settings=sd.WasapiSettings(auto_convert=True))
-        self.stream.start()
+        try:
+            self.stream.start()
+        except Exception:
+            self.stream.close()
+            self.stream = None
+            raise
         return self
 
     def record(self, numframes):
@@ -86,3 +93,104 @@ def open_recorder(microphone, source, samplerate=16000):
         return MicrophoneRecorder(microphone, samplerate)
     return microphone.recorder(samplerate=samplerate,
         channels=list(range(microphone.channels)), blocksize=samplerate // 4)
+
+
+def capture_worker(source, selection, messages, stop, rate, frames):
+    """Own all native device calls in a process that the parent can restart."""
+    def send(kind, **data):
+        if not stop.is_set():
+            messages.send({'type': kind, **data})
+
+    try:
+        with com_apartment():
+            import soundcard as sc
+
+            def device():
+                if source == 'Computer':
+                    speaker = sc.get_speaker(selection) if selection else sc.default_speaker()
+                    if speaker is None:
+                        raise RuntimeError('The selected output is unavailable. Choose another output or Follow Windows default.')
+                    return sc.get_microphone(speaker.id, include_loopback=True)
+                return sc.get_microphone(selection) if selection else sc.default_microphone()
+
+            mic = device()
+            if mic is None:
+                raise RuntimeError('No audio device is available.')
+            send('device', message=mic.name)
+            if source == 'Computer' and selection:
+                default = sc.default_speaker()
+                if default is not None and default.id != mic.id:
+                    send('wrong_output', selected=mic.name, playing=default.name)
+            with open_recorder(mic, source, rate) as recorder:
+                send('capture_ready', message=mic.name)
+                check_at = time.monotonic() + 1.
+                while not stop.is_set():
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter('always')
+                        data = recorder.record(numframes=frames)
+                    send('audio', data=data, captured=time.monotonic(), discontinuities=len(caught))
+                    if not selection and time.monotonic() >= check_at:
+                        check_at = time.monotonic() + 1.
+                        if device().id != mic.id:
+                            send('device_changed', message=f'{source} device changed. Reconnecting…')
+                            return
+    except Exception as exc:
+        send('capture_error', message=f'{source}: {type(exc).__name__}: {exc}')
+    finally:
+        # A single writer and no background queue feeder: EOF remains observable
+        # if a native crash interrupts a message.
+        messages.close()
+
+
+class CaptureProcess:
+    """Bounded reads and shutdown, including device opening and native driver hangs."""
+    def __init__(self, source, selection, rate=16000, frames=1536, *, timeout=8., startup_timeout=30., target=capture_worker):
+        context = multiprocessing.get_context('spawn')
+        self.messages, self.writer = context.Pipe(duplex=False)
+        self.stop_event = context.Event()
+        self.process = context.Process(target=target,
+            args=(source, selection, self.writer, self.stop_event, rate, frames),
+            name=f'audio-{source}', daemon=True)
+        self.timeout = timeout
+        self.startup_timeout = startup_timeout
+        self.received = False
+        self.last_message = time.monotonic()
+        self.started = False
+
+    def __enter__(self):
+        try:
+            self.process.start()
+            self.started = True
+            self.writer.close()
+            self.last_message = time.monotonic()
+            return self
+        except Exception:
+            self.messages.close()
+            self.writer.close()
+            raise
+
+    def receive(self, timeout=.1):
+        if not self.messages.poll(timeout):
+            if not self.process.is_alive():
+                raise RuntimeError(f'Audio worker exited (code {self.process.exitcode}).')
+            if time.monotonic() - self.last_message > (self.timeout if self.received else self.startup_timeout):
+                raise TimeoutError('The audio device stopped responding. Reconnecting…')
+            return None
+        try:
+            message = self.messages.recv()
+        except (EOFError, OSError) as exc:
+            raise RuntimeError('Audio worker disconnected. Reconnecting…') from exc
+        self.last_message = time.monotonic()
+        self.received = True
+        return message
+
+    def __exit__(self, *args):
+        self.stop_event.set()
+        if self.started:
+            self.process.join(timeout=.3)
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join(timeout=1.)
+            if not self.process.is_alive():
+                self.process.close()
+        self.messages.close()
