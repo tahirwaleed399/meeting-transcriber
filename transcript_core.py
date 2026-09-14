@@ -4,9 +4,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 import json
+import math
+import os
 from pathlib import Path
 import queue
+import tempfile
 import threading
+import time
 import uuid
 
 ROOT = Path(__file__).resolve().parent
@@ -41,6 +45,13 @@ class Settings:
                 return cls()
             allowed = {field.name for field in fields(cls)}
             obj = cls(**{k: v for k, v in raw.items() if k in allowed})
+            defaults = cls()
+            for name in ('profile', 'source', 'output_id', 'microphone_id', 'language', 'vocabulary', 'hotkey'):
+                if not isinstance(getattr(obj, name), str):
+                    setattr(obj, name, getattr(defaults, name))
+            for name in ('auto_copy', 'always_on_top', 'dictation'):
+                if not isinstance(getattr(obj, name), bool):
+                    setattr(obj, name, getattr(defaults, name))
             if obj.profile not in PROFILES or obj.language not in LANGUAGES:
                 return cls()
             if obj.source not in ('Computer audio', 'Microphone', 'Computer + microphone'):
@@ -58,14 +69,27 @@ class Settings:
 
 
 def atomic_write(path: Path, text: str):
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + '.tmp')
-    with temporary.open('w', encoding='utf-8', newline='\n') as stream:
-        stream.write(text)
-        stream.flush()
-        import os
-        os.fsync(stream.fileno())
-    temporary.replace(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='\n',
+                dir=path.parent, prefix=path.name + '.', suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        for attempt in range(6):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(.02 * 2 ** attempt)
+    finally:
+        if temporary:
+            temporary.unlink(missing_ok=True)
 
 
 @dataclass
@@ -132,9 +156,18 @@ class Transcript:
                 'entries': [asdict(entry) for entry in self.ordered()], 'text': self.text()}
 
     def restore(self, snapshot):
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get('entries'), list):
+            raise ValueError('The saved session has no valid entries list.')
         restored = []
         for data in snapshot.get('entries', []):
-            restored.append(Entry(**{**data, 'key': 'restored-' + uuid.uuid4().hex, 'final': True}))
+            if not isinstance(data, dict):
+                raise ValueError('A saved transcript entry is invalid.')
+            entry = Entry(**{**data, 'key': 'restored-' + uuid.uuid4().hex, 'final': True})
+            if (not isinstance(entry.text, str) or not isinstance(entry.source, str)
+                    or not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (entry.start, entry.end))
+                    or entry.start < 0 or entry.end < entry.start):
+                raise ValueError('A saved transcript entry has invalid text or timestamps.')
+            restored.append(entry)
         self.entries.update((entry.key, entry) for entry in restored)
 
 
@@ -160,33 +193,41 @@ class Autosaver:
         self.pending = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
         self.last_error = None
+        self.submit_lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, name='transcript-save', daemon=True)
         self.thread.start()
 
     def submit(self, snapshot):
-        try:
-            self.pending.put_nowait(snapshot)
-        except queue.Full:
+        with self.submit_lock:
             try:
-                self.pending.get_nowait()
-            except queue.Empty:
-                pass
-            self.pending.put_nowait(snapshot)
+                self.pending.put_nowait(snapshot)
+            except queue.Full:
+                try:
+                    self.pending.get_nowait()
+                except queue.Empty:
+                    pass
+                self.pending.put_nowait(snapshot)
 
     def _run(self):
+        retry = None
         while not self.stop_event.is_set() or not self.pending.empty():
             try:
                 snapshot = self.pending.get(timeout=.15)
             except queue.Empty:
-                continue
+                if retry is None:
+                    continue
+                snapshot = retry
             try:
                 atomic_write(self.path, snapshot['text'])
                 atomic_write(self.directory / 'latest.json', json.dumps(snapshot, ensure_ascii=False, indent=2))
                 self.last_error = None
+                retry = None
                 self.events.put({'type': 'saved', 'path': str(self.path)})
-            except OSError as exc:
+            except Exception as exc:
                 self.last_error = str(exc)
+                retry = snapshot
                 self.events.put({'type': 'save_error', 'message': str(exc)})
+                self.stop_event.wait(1.)
 
     def close(self):
         self.stop_event.set()
