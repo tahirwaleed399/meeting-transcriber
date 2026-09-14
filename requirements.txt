@@ -1,0 +1,6 @@
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+numpy==2.5.3
+SoundCard==0.4.6
+sounddevice==0.5.6
+onnxruntime==1.30.0

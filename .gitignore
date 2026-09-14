@@ -1,0 +1,14 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.env.*
+!.env.example
+models/
+hf_cache/
+.firecrawl/
+sessions/
+settings.json
+*.log
