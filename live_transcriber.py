@@ -11,6 +11,7 @@ from pathlib import Path
 import queue
 import threading
 import time
+import uuid
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -58,6 +59,7 @@ class TranscriberApp:
         self.engine_error = ''
         self.capture_errors = {}
         self.save_finished = threading.Event()
+        self.save_started = False
         self.session_started = time.monotonic()
         self.rendered = ''
         self.last_autocopy = ''
@@ -69,11 +71,15 @@ class TranscriberApp:
         self.debug_window = self.debug_text = None
         self.debug_history, self.debug_rows = [], {}
         self.debug_summary = None
-        self.silence_warned = False
+        self.silence_warned = set()
         self.hotkey = GlobalHotkey()
         self.dictating = False
         self.burst_started = 0.
-        self.burst_settle_ms = 1400  # Let the endpoint pause and final decode land.
+        self.burst_finishing = False
+        self.burst_engine = None
+        self.burst_epoch = None
+        self.burst_capture_error = False
+        self.recovering = False
         self._style()
         self._build()
         self._shortcuts()
@@ -204,6 +210,8 @@ class TranscriberApp:
         self.source_hint.pack(anchor='w', pady=(8, 10))
         self.button(sidebar, 'Open saved sessions', self.open_sessions, compact=True).pack(side='bottom', fill='x')
         self.button(sidebar, 'Diagnostics (F12)', self.toggle_debug, compact=True).pack(side='bottom', fill='x', pady=(0, 6))
+        self.button(sidebar, 'Retry failed phrases', self.retry_failed, compact=True).pack(side='bottom', fill='x', pady=(0, 6))
+        self.button(sidebar, 'Recover saved audio…', self.recover_saved_audio, compact=True).pack(side='bottom', fill='x', pady=(0, 6))
         def scroll_sidebar(event):
             sidebar_canvas.yview_scroll(-int(event.delta / 120), 'units')
             return 'break'
@@ -376,12 +384,15 @@ class TranscriberApp:
                         microphone_id=self.device_maps['microphone'].get(self.mic_var.get(), ''),
                         language=self.language_var.get(), vocabulary=self.vocabulary.get(),
                         auto_copy=self.autocopy_var.get(), always_on_top=self.top_var.get(),
-                        font_size=self.settings.font_size)
+                        font_size=self.settings.font_size, dictation=self.dictation_var.get(),
+                        hotkey=self.hotkey_var.get())
 
     def toggle_recording(self):
         if self.closing:
             return
         if self.engine and not self.engine.finished.is_set():
+            self.cancel_burst()
+            self.dictating = False
             self.engine.stop()
             self.record_button.config(text='Finishing…', state='disabled')
             self.status_label.config(text='●  Finishing the last phrase…', fg=ACCENT)
@@ -392,20 +403,30 @@ class TranscriberApp:
             self.handle_event(self.events.get_nowait())
         old_engine = self.engine
         self.settings = self.read_settings()
+        if (old_engine and old_engine.mailbox.unsaved_count()
+                and (old_engine.settings.profile, old_engine.settings.language) != (self.settings.profile, self.settings.language)):
+            self.toast('Some audio is only in memory. Keep the previous mode and language, free disk space, and Resume before changing them.', True)
+            return
         self.engine_error = ''
         self.capture_errors = {}
+        self.silence_warned.clear()
         self.save_preferences()
         offset = time.monotonic() - self.session_started
-        self.engine = TranscriptionEngine(self.settings, self.events, self.transcript.epoch, offset)
+        self.engine = TranscriptionEngine(self.settings, self.events, self.transcript.epoch, offset,
+                                         pending_dir=self.session_dir / 'pending-audio' / uuid.uuid4().hex)
         if old_engine and (old_engine.settings.profile, old_engine.settings.language) == (self.settings.profile, self.settings.language):
             self.engine.recognizer.models = old_engine.recognizer.models
             self.engine.recognizer.device = old_engine.recognizer.device
             self.engine.recognizer.compute = old_engine.recognizer.compute
+            if old_engine.epoch == self.transcript.epoch:
+                self.engine.mailbox = old_engine.mailbox
+                self.engine.mailbox.settings = self.settings
+                self.engine.retry_failed()
         self.record_button.config(text='Cancel loading', state='normal')
         self.status_label.config(text='●  Preparing transcription…', fg=ACCENT)
         self.set_settings_enabled(False)
         if self.dictation_var.get():
-            self.engine.armed.clear()  # Warm up the models without recording anything.
+            self.engine.disarm()  # Warm up the models without recording anything.
         self.engine.start()
 
     def set_settings_enabled(self, enabled):
@@ -463,6 +484,7 @@ class TranscriberApp:
     def clear(self):
         if self.closing:
             return
+        self.cancel_burst()
         epoch = self.transcript.clear()
         self.dirty = True
         if self.engine:
@@ -531,6 +553,47 @@ class TranscriberApp:
             os.startfile(str(self.session_dir))
         except OSError as exc:
             self.toast(f'Could not open sessions: {exc}', True)
+
+    def retry_failed(self):
+        if self.closing:
+            return
+        if not self.engine or not (self.engine.mailbox.failed_count() or len(self.engine.mailbox)):
+            self.toast('No failed phrases in this session. Use Recover saved audio for an earlier session.')
+            return
+        if self.engine.finished.is_set():
+            settings = self.read_settings()
+            if (settings.profile, settings.language) != (self.engine.settings.profile, self.engine.settings.language):
+                self.toast('Restore the previous mode and language before retrying, or use Recover saved audio.', True)
+                return
+            self.toggle_recording()
+        elif self.engine.stop_event.is_set():
+            self.toast('Please wait for Pause to finish, then retry.')
+            return
+        else:
+            self.engine.retry_failed()
+        self.engine_error = ''
+        self.toast('Retrying failed phrases. Existing text is kept.')
+
+    def recover_saved_audio(self):
+        if self.closing or self.recovering:
+            return
+        paths = filedialog.askopenfilenames(parent=self.root, title='Recover saved phrases',
+            initialdir=str(self.session_dir / 'pending-audio'), filetypes=[('Saved audio phrases', '*.npz')])
+        if not paths:
+            return
+        self.recovering = True
+        def worker():
+            try:
+                from audio_recovery import recover_files
+                path, count, failures = recover_files(paths, self.session_dir,
+                    emit=lambda message: self.events.put({'type': 'debug', 'message': message}))
+                self.events.put({'type': 'recovery_done', 'message':
+                    f'Recovered {count} phrases to {path.name}. Open saved sessions to read it.'
+                    + (f' {len(failures)} phrases still need recovery; details are in the matching JSON file.' if failures else '')})
+            except Exception as exc:
+                self.events.put({'type': 'recovery_done', 'message': f'Recovery failed; original audio is kept. {exc}', 'error': True})
+        threading.Thread(target=worker, name='audio-recovery', daemon=True).start()
+        self.toast('Recovering saved audio into a separate transcript. Original audio is kept.')
 
     def top_changed(self):
         self.root.attributes('-topmost', self.top_var.get())
@@ -611,12 +674,15 @@ class TranscriberApp:
                 self.update_dictation_hint()
                 return
             self.toast('Dictation mode on. Press Start listening to warm up, then use '
-                       + self.hotkey_var.get() + ' anywhere.')
+                        + self.hotkey_var.get() + ' anywhere.')
+            if self.engine:
+                self.engine.disarm()
         else:
+            self.cancel_burst()
             self.hotkey.unregister()
             # Leaving the mode must not strand the engine in a disarmed state.
             if self.engine:
-                self.engine.armed.set()
+                self.engine.arm()
             self.dictating = False
         self.save_preferences()
         self.update_dictation_hint()
@@ -645,6 +711,12 @@ class TranscriberApp:
         elif not self.engine or self.engine.finished.is_set():
             text = 'Press Start listening once to load the models, then ' + self.hotkey_var.get() + ' starts a burst.'
             colour = MUTED
+        elif not self.engine.can_record():
+            text = 'Connecting audio devices. Wait until audio is ready before starting a burst.'
+            colour = MUTED
+        elif self.burst_finishing:
+            text = 'Finishing and copying the last phrase. Please wait before starting the next burst.'
+            colour = ACCENT
         elif self.dictating:
             text = 'Recording. Press ' + self.hotkey_var.get() + ' to stop, copy and reset.'
             colour = ACCENT
@@ -663,7 +735,12 @@ class TranscriberApp:
 
     def toggle_burst(self):
         """Start a dictation burst, or end one and put its text on the clipboard."""
-        if not self.engine or self.engine.finished.is_set() or not self.engine.ready.is_set():
+        if self.closing:
+            return
+        if self.burst_finishing:
+            self.toast('Still finishing the previous burst. Your speech is being kept; please wait.')
+            return
+        if not self.engine or self.engine.stop_event.is_set() or self.engine.finished.is_set() or not self.engine.ready.is_set():
             self.toast('Press Start listening first so the models are loaded.', True)
             return
         if self.dictating:
@@ -672,8 +749,14 @@ class TranscriberApp:
             self.begin_burst()
 
     def begin_burst(self):
+        if self.burst_finishing or self.closing:
+            return
+        if not self.engine.can_record():
+            self.toast('Audio devices are still connecting. Wait until audio is ready before dictating.', True)
+            return
         self.dictating = True
-        self.engine.armed.set()
+        self.burst_capture_error = False
+        self.engine.arm()
         self.burst_started = time.monotonic()
         self.status_label.config(text='●  Recording · press ' + self.hotkey_var.get() + ' to stop and copy',
                                  fg=ACCENT)
@@ -683,14 +766,39 @@ class TranscriberApp:
     def end_burst(self):
         """Stop capture, wait for the last phrase, then copy and reset."""
         self.dictating = False
-        self.engine.armed.clear()
+        self.burst_finishing = True
+        self.burst_engine = self.engine
+        self.burst_epoch = self.transcript.epoch
+        self.engine.disarm()
         self.status_label.config(text='●  Finishing the last phrase…', fg=ACCENT)
         self.update_dictation_hint()
         self.log_debug('dictation: burst ended, waiting for final phrases')
-        # The tail of speech is still decoding; collect it before copying.
-        self.root.after(self.burst_settle_ms, self.finish_burst)
+
+    def cancel_burst(self):
+        self.burst_finishing = False
+        self.burst_engine = None
+        self.burst_epoch = None
 
     def finish_burst(self):
+        if not self.burst_finishing or self.closing:
+            return
+        if (self.engine is not self.burst_engine or self.transcript.epoch != self.burst_epoch
+                or not self.dictation_var.get()):
+            self.cancel_burst()
+            return
+        if not self.engine.is_drained():
+            return
+        # Drained means all capture flushes and decodes completed. Their result
+        # events may still be queued behind the latest GUI poll.
+        while not self.events.empty():
+            self.handle_event(self.events.get_nowait())
+        if not self.burst_finishing:
+            return
+        self.cancel_burst()
+        if self.engine.mailbox.failed_count() or self.burst_capture_error:
+            self.toast('This burst had an interruption. Text is kept; use Retry failed phrases or Copy all.', True)
+            self.update_dictation_hint()
+            return
         text = self.transcript.text()
         if not text.strip():
             self.status_label.config(text='●  Nothing was captured. Press ' + self.hotkey_var.get()
@@ -913,6 +1021,10 @@ class TranscriberApp:
         if kind == 'debug':
             self.log_debug(event['message'])
             return
+        if kind == 'recovery_done':
+            self.recovering = False
+            self.toast(event['message'], event.get('error', False))
+            return
         if 'engine' in event and (not self.engine or event['engine'] != id(self.engine)):
             self.log_debug('(stale engine) ' + kind)
             return
@@ -922,8 +1034,8 @@ class TranscriberApp:
         if kind == 'transcript':
             if self.transcript.apply(event['epoch'], event['entry']):
                 self.dirty = True
-                self.render()
                 self.saver.submit(self.transcript.snapshot())
+                self.render()
                 if self.autocopy_var.get() and self.copy_after is None:
                     self.copy_after = self.root.after(450, self.auto_copy)
             pending = f" · {event['backlog']} phrases waiting" if event['backlog'] else ''
@@ -931,25 +1043,34 @@ class TranscriberApp:
         elif kind == 'ready':
             if not self.engine.stop_event.is_set():
                 self.record_button.config(text='Pause', state='normal')
+                if self.capture_errors or self.engine_error:
+                    return
                 if self.dictation_var.get():
-                    self.status_label.config(text='●  Ready · press ' + self.hotkey_var.get()
-                                             + ' anywhere to dictate', fg=ACCENT)
+                    message = ('Ready · press ' + self.hotkey_var.get() + ' anywhere to dictate'
+                               if self.engine.can_record() else 'Connecting audio devices…')
+                    self.status_label.config(text='●  ' + message, fg=ACCENT)
                     self.update_dictation_hint()
                 elif not self.capture_errors:
-                    self.status_label.config(text='●  Listening · ' + event['message'], fg=ACCENT)
+                    active = any(v.get('state') == 'capturing' for v in self.engine.snapshot_stats().values())
+                    self.status_label.config(text=('●  Listening · ' if active else '●  Connecting audio · ') + event['message'], fg=ACCENT)
         elif kind == 'status':
             self.status_label.config(text='●  ' + event['message'], fg=ACCENT)
-        elif kind in ('error', 'capture_error'):
-            if kind == 'error':
+        elif kind in ('error', 'capture_error', 'decode_error'):
+            if kind in ('error', 'decode_error'):
                 self.engine_error = event['message']
             else:
                 self.capture_errors[event['source']] = event['message']
+                if self.dictating or self.burst_finishing:
+                    self.burst_capture_error = True
             self.status_label.config(text='●  ' + event['message'], fg=RED)
             logging.error(event['message'])
         elif kind == 'warning':
             self.toast(event['message'], True)
             logging.warning(event['message'])
         elif kind == 'stopped':
+            self.cancel_burst()
+            self.dictating = False
+            self.update_dictation_hint()
             if not self.closing:
                 self.record_button.config(text='Resume' if self.transcript.entries else 'Start listening', state='normal')
                 message = self.engine_error or 'Paused · Copy, save, or resume at any time'
@@ -960,16 +1081,20 @@ class TranscriberApp:
         elif kind == 'device':
             self.toast(f"{event['source']}: {event['message']}")
         elif kind == 'capture_ready':
-            self.silence_warned = False
+            self.silence_warned.discard(event['source'])
             self.capture_errors.pop(event['source'], None)
+            if self.dictation_var.get():
+                self.update_dictation_hint()
+                if (self.engine and self.engine.can_record() and not self.engine.stop_event.is_set()
+                        and not self.engine_error and not self.dictating and not self.burst_finishing):
+                    self.status_label.config(text='●  Ready · press ' + self.hotkey_var.get() + ' anywhere to dictate', fg=ACCENT)
             if (not self.capture_errors and self.engine and self.engine.ready.is_set()
-                    and not self.engine.stop_event.is_set() and not self.dictation_var.get()):
+                    and not self.engine.stop_event.is_set() and not self.dictation_var.get() and not self.engine_error):
                 self.status_label.config(text='●  Listening · ' + self.settings.source, fg=ACCENT)
         elif kind == 'wrong_output':
-            message = ('Capturing "%s" but Windows is playing to "%s". You will record silence. '
-                       'Change Computer output, or choose Follow Windows default.'
+            message = ('Capturing "%s"; Windows default is "%s". '
+                       'Make sure the meeting plays through the selected output, or choose Follow Windows default.'
                        % (event['selected'], event['playing']))
-            self.status_label.config(text='●  ' + message, fg=RED)
             self.toast(message, True)
             logging.warning(message)
         elif kind == 'discontinuity':
@@ -995,6 +1120,16 @@ class TranscriberApp:
             self.toast(event['message'], True)
 
     def poll(self):
+        try:
+            self._poll_once()
+        except Exception as exc:
+            logging.exception('GUI event processing failed')
+            self.toast(f'An update failed; processing continues. {exc}', True)
+        finally:
+            if not self.save_started:
+                self.root.after(50, self.poll)
+
+    def _poll_once(self):
         for _ in range(250):
             try:
                 event = self.events.get_nowait()
@@ -1006,6 +1141,7 @@ class TranscriberApp:
             meter.coords('level', 0, 0, int(level * 138), 8)
             self.last_levels[source] *= .8
         self.poll_hotkey()
+        self.finish_burst()
         self.check_silence()
         self.timer_label.config(text=timestamp(time.monotonic() - self.session_started))
         if self.closing and (not self.engine or self.engine.finished.is_set()):
@@ -1013,40 +1149,54 @@ class TranscriberApp:
                 self.handle_event(self.events.get_nowait())
             if self.dirty:
                 self.saver.submit(self.transcript.snapshot())
+            self.save_started = True
             threading.Thread(target=self.finish_save, name='close-save', daemon=True).start()
             self.root.after(50, self.check_closed)
             return
-        self.root.after(50, self.poll)
 
     def check_silence(self):
-        """Warn once when capture is healthy but every block has been pure silence."""
-        if self.silence_warned or not self.engine or not self.engine.ready.is_set():
+        """Warn per source after sustained silence, including silence later in a call."""
+        if not self.engine or not self.engine.ready.is_set():
             return
         if self.engine.stop_event.is_set():
             return
+        recovered = False
         for source, values in self.engine.snapshot_stats().items():
-            # ~30s of blocks at 96 ms, all digitally silent.
-            if (values.get('state') == 'capturing' and values.get('blocks_n', 0) > 310
-                    and values.get('peak_max', 0.) < 1e-4):
-                self.silence_warned = True
+            if values.get('digital_silence', 0.) < 1.:
+                recovered = recovered or source in self.silence_warned
+                self.silence_warned.discard(source)
+            if (values.get('state') == 'capturing' and values.get('digital_silence', 0.) >= 30.
+                    and source not in self.silence_warned):
+                self.silence_warned.add(source)
                 message = ('%s has received only silence for 30s. Check that audio is playing to the '
                            'selected device, then press F12 for diagnostics.' % source)
                 self.status_label.config(text='●  ' + message, fg=RED)
                 self.toast(message, True)
                 logging.warning(message)
                 return
+        if (recovered and not self.silence_warned and not self.capture_errors and not self.engine_error
+                and not self.dictation_var.get()):
+            self.status_label.config(text='●  Listening · ' + self.settings.source, fg=ACCENT)
 
     def finish_save(self):
-        self.saver.close()
-        self.save_finished.set()
+        try:
+            self.saver.close()
+        except Exception as exc:
+            self.saver.last_error = str(exc)
+            logging.exception('Final save failed')
+        finally:
+            self.save_finished.set()
 
     def check_closed(self):
         if self.save_finished.is_set():
-            if self.saver.last_error and not messagebox.askyesno('Transcript could not be saved',
-                'Automatic saving failed. Close anyway?\n\nChoose No to return and use Copy all or Save as.\n\n' + self.saver.last_error,
+            unsaved = self.engine.mailbox.unsaved_count() if self.engine else 0
+            save_error = self.saver.last_error or (f'{unsaved} audio phrases are only in memory. Free disk space and Resume to retry them.' if unsaved else '')
+            if save_error and not messagebox.askyesno('Transcript could not be saved',
+                'Some work could not be saved. Close anyway?\n\nChoose No to return, free disk space, retry, or use Copy all / Save as.\n\n' + save_error,
                 parent=self.root):
                 self.closing = False
                 self.save_finished.clear()
+                self.save_started = False
                 self.saver = Autosaver(self.events, self.session_dir)
                 self.record_button.config(text='Start listening', state='normal')
                 self.clear_button.config(state='normal')
@@ -1062,6 +1212,8 @@ class TranscriberApp:
         if self.closing:
             return
         self.closing = True
+        self.cancel_burst()
+        self.dictating = False
         self.record_button.config(text='Finishing…', state='disabled')
         self.clear_button.config(state='disabled')
         self.status_label.config(text='●  Finishing pending speech and saving your transcript…', fg=ACCENT)

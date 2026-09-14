@@ -1,8 +1,7 @@
 """Local streaming speech recognition with bounded drafts and distinct audio sources."""
 from __future__ import annotations
 
-from collections import OrderedDict, deque
-from dataclasses import dataclass
+from collections import deque
 import logging
 import os
 from pathlib import Path
@@ -11,12 +10,12 @@ import site
 import threading
 import time
 import uuid
-import warnings
 
 import numpy as np
 
 from transcript_core import Entry, LANGUAGES, PROFILES, ROOT, Settings
-from audio_capture import com_apartment, open_recorder
+from audio_capture import CaptureProcess
+from audio_jobs import AudioJob, Mailbox
 
 RATE = 16000
 FRAMES = 1536  # 96 ms; exactly three Silero frames.
@@ -33,57 +32,10 @@ def configure_runtime():
     if folders:
         os.environ['PATH'] = os.pathsep.join(map(str, folders)) + os.pathsep + os.environ.get('PATH', '')
         for folder in folders:
-            _dll_handles.append(os.add_dll_directory(str(folder)))
-
-
-@dataclass
-class AudioJob:
-    key: str
-    epoch: int
-    source: str
-    start: float
-    audio: np.ndarray
-    final: bool
-    revision: int
-    created: float
-    previous_key: str | None = None
-    truncated: bool = False
-
-
-class Mailbox:
-    """New drafts replace queued drafts; finalized utterances are never overwritten."""
-    def __init__(self, max_items=64):
-        self.condition = threading.Condition()
-        self.items = OrderedDict()
-        self.max_items = max_items
-
-    def put(self, job):
-        with self.condition:
-            old = self.items.get(job.key)
-            if old and (old.final or old.revision > job.revision):
-                return
-            if old is None and len(self.items) >= self.max_items:
-                raise BufferError('Transcription is falling behind. Capture stopped to protect pending text.')
-            self.items[job.key] = job
-            self.condition.notify()
-
-    def get(self, timeout=.1):
-        with self.condition:
-            if not self.items:
-                self.condition.wait(timeout)
-            if not self.items:
-                return None
-            # Finish spoken phrases first; choose the oldest remaining draft fairly.
-            key = next((key for key, job in self.items.items() if job.final), next(iter(self.items)))
-            return self.items.pop(key)
-
-    def clear(self):
-        with self.condition:
-            self.items.clear()
-
-    def __len__(self):
-        with self.condition:
-            return len(self.items)
+            try:
+                _dll_handles.append(os.add_dll_directory(str(folder)))
+            except OSError:
+                logging.warning('Could not add optional GPU library directory: %s', folder)
 
 
 class StreamingVAD:
@@ -124,6 +76,9 @@ class SpeechSegmenter:
         self.previous_key = None
         self.carry = None
         self.carry_start = 0.
+
+    def reset(self, epoch):
+        self.__init__(self.source, epoch, self.publish, self.interval, self.endpoint)
 
     def feed(self, audio, start, probability):
         speech = probability >= (.32 if self.key else .5)
@@ -198,12 +153,16 @@ class Recognizer:
         self.preview_name, self.final_name = preview, final
         if not force_cpu and preview in self.models and final in self.models:
             return f'{self.device.upper()} · {preview} drafts / {final} final'
-        if not force_cpu and ctranslate2.get_cuda_device_count():
-            supported = ctranslate2.get_supported_compute_types('cuda')
-            self.device = 'cuda'
-            self.compute = 'int8_float16' if 'int8_float16' in supported else 'float16'
-        else:
-            self.device, self.compute = 'cpu', 'int8'
+        self.device, self.compute = 'cpu', 'int8'
+        if not force_cpu:
+            try:
+                if ctranslate2.get_cuda_device_count():
+                    supported = ctranslate2.get_supported_compute_types('cuda')
+                    self.device = 'cuda'
+                    self.compute = 'int8_float16' if 'int8_float16' in supported else 'float16'
+            except Exception as exc:
+                self.emit('warning', message=f'GPU detection failed; using CPU. {exc}')
+                self.device, self.compute = 'cpu', 'int8'
         self.models.clear()
         try:
             for name in dict.fromkeys((preview, final)):
@@ -262,10 +221,17 @@ class Recognizer:
 
 
 class TranscriptionEngine:
-    def __init__(self, settings: Settings, events: queue.Queue, epoch=0, time_offset=0.):
+    def __init__(self, settings: Settings, events: queue.Queue, epoch=0, time_offset=0., *, pending_dir=None):
         self.settings, self.events, self.epoch = settings, events, epoch
         self.time_offset = time_offset
-        self.mailbox = Mailbox()
+        self.mailbox = Mailbox(directory=pending_dir, settings=settings)
+        self.state_lock = threading.RLock()
+        self.decoding = False
+        self.flush_pending = set()
+        self.disarmed_at = None
+        self.reset_at = time.monotonic()
+        self.stop_at = None
+        self.backlog_warned = False
         self.stop_event = threading.Event()
         self.captures_done = threading.Event()
         self.finished = threading.Event()
@@ -281,6 +247,41 @@ class TranscriptionEngine:
         # so a burst starts instantly instead of reopening devices and reloading models.
         self.armed = threading.Event()
         self.armed.set()
+
+    def sources(self):
+        if self.settings.source == 'Computer + microphone':
+            return ['Computer', 'You']
+        return ['Computer'] if self.settings.source == 'Computer audio' else ['You']
+
+    def can_record(self):
+        stats = self.snapshot_stats()
+        now = time.monotonic()
+        return self.ready.is_set() and all(
+            stats.get(source, {}).get('state') in ('capturing', 'idle')
+            and now - stats[source].get('last_block', 0.) < 8.
+            for source in self.sources())
+
+    def arm(self):
+        with self.state_lock:
+            self.reset_at = time.monotonic()
+            self.disarmed_at = None
+            self.flush_pending.clear()
+            self.armed.set()
+
+    def disarm(self):
+        with self.state_lock:
+            if self.armed.is_set():
+                self.disarmed_at = time.monotonic()
+                self.flush_pending = set(self.sources()) if self.capture_threads else set()
+                self.armed.clear()
+
+    def is_drained(self):
+        with self.state_lock:
+            return not self.armed.is_set() and not self.flush_pending and not self.decoding and not len(self.mailbox)
+
+    def retry_failed(self):
+        with self.state_lock:
+            self.mailbox.retry_failed()
 
     def note(self, source, **fields):
         """Record the latest per-source pipeline state for diagnostics."""
@@ -306,19 +307,58 @@ class TranscriptionEngine:
         self.thread.start()
 
     def clear(self, epoch):
-        self.epoch = epoch
-        self.mailbox.clear()
+        with self.state_lock:
+            self.epoch = epoch
+            self.reset_at = time.monotonic()
+            self.mailbox.clear()
+            if not self.armed.is_set():
+                self.flush_pending.clear()
 
     def stop(self):
-        self.stop_event.set()
+        with self.state_lock:
+            if self.stop_event.is_set():
+                return
+            self.stop_at = time.monotonic()
+            self.disarm()
+            self.stop_event.set()
 
     def submit(self, job):
         self.note(job.source, jobs_n=1, last_job=('final' if job.final else 'draft'),
                   job_seconds=len(job.audio) / RATE)
-        if job.epoch == self.epoch:
-            self.mailbox.put(job)
-        else:
-            self.note(job.source, dropped_n=1)
+        with self.state_lock:
+            if job.epoch == self.epoch:
+                self.mailbox.put(job)
+                if len(self.mailbox) >= self.mailbox.max_items and not self.backlog_warned:
+                    self.backlog_warned = True
+                    self.emit('warning', message='Transcription is behind. Extra phrases are buffered locally; capture continues. Fastest mode reduces the delay.')
+            else:
+                self.note(job.source, dropped_n=1)
+
+    def _decode(self, job):
+        for attempt in range(3):
+            if job.epoch != self.epoch:
+                return None
+            try:
+                if (attempt == 1 and self.recognizer.device == 'cuda') or attempt == 2:
+                    self.recognizer.load(force_cpu=True)
+                return self.recognizer.transcribe(job)
+            except Exception as exc:
+                self.emit('warning', message=f'Decode attempt {attempt + 1}/3 failed; '
+                          + ('retrying. ' if attempt < 2 else 'keeping the phrase for recovery. ') + str(exc))
+                if attempt < 2:
+                    time.sleep(.1 * (attempt + 1))
+        if job.final:
+            with self.state_lock:
+                if job.epoch != self.epoch:
+                    return None
+                try:
+                    self.mailbox.fail(job)
+                    message = 'A phrase could not be decoded. Audio is saved locally; use Retry failed phrases or Recover saved audio.'
+                except OSError as exc:
+                    message = f'Cannot save failed audio: {exc}. Audio is retained in memory. Free disk space, then Resume to retry.'
+                    self.stop()
+                self.emit('decode_error', message=message, pending=self.mailbox.failed_count())
+        return None
 
     def _run(self, capture):
         try:
@@ -327,142 +367,154 @@ class TranscriptionEngine:
                 return
             self.origin = time.monotonic()
             if capture:
-                sources = ['Computer'] if self.settings.source == 'Computer audio' else ['You']
-                if self.settings.source == 'Computer + microphone':
-                    sources = ['Computer', 'You']
-                # Initialize VAD before calling a device ready.
-                for source in sources:
-                    vad = StreamingVAD()
-                    thread = threading.Thread(target=self._capture, args=(source, vad),
+                for source in self.sources():
+                    thread = threading.Thread(target=self._capture, args=(source,),
                                               name=f'capture-{source}', daemon=True)
                     self.capture_threads.append(thread)
                     thread.start()
             self.ready.set()
             self.emit('ready', message=description)
+            boundary_epoch = self.epoch
             while True:
                 if self.stop_event.is_set() and not any(t.is_alive() for t in self.capture_threads) and not len(self.mailbox):
                     break
-                job = self.mailbox.get()
+                with self.state_lock:
+                    try:
+                        job = self.mailbox.get(timeout=0)
+                    except Exception as exc:
+                        self.emit('decode_error', message=f'Cannot read a saved phrase: {exc}. Other phrases will continue.',
+                                  pending=self.mailbox.failed_count())
+                        job = None
+                    self.decoding = job is not None
                 if job is None or job.epoch != self.epoch:
+                    self.decoding = False
+                    time.sleep(.02)
                     continue
                 started = time.monotonic()
                 try:
-                    text = self.recognizer.transcribe(job)
-                except Exception as exc:
-                    if self.recognizer.device == 'cuda':
-                        self.emit('warning', message=f'GPU interrupted; retrying on CPU. {exc}')
-                        self.recognizer.load(force_cpu=True)
-                        text = self.recognizer.transcribe(job)
-                    else:
-                        self.emit('error', message=f'Transcription failed. {exc}')
-                        self.stop_event.set()
+                    if boundary_epoch != self.epoch:
+                        self.recognizer.boundaries.clear()
+                        boundary_epoch = self.epoch
+                    text = self._decode(job)
+                    if text is None:
                         continue
-                self.note(job.source, decodes_n=1, inference=time.monotonic() - started,
-                          text_chars=len(text.strip()))
-                if job.epoch == self.epoch:
-                    entry = Entry(job.key, job.source, job.start, job.start + len(job.audio) / RATE,
-                                  text, job.final, job.revision)
-                    self.emit('transcript', epoch=job.epoch, entry=entry,
-                              inference=time.monotonic() - started, backlog=len(self.mailbox),
-                              latency=time.monotonic() - job.created)
+                    self.note(job.source, decodes_n=1, inference=time.monotonic() - started,
+                              text_chars=len(text.strip()))
+                    if job.epoch == self.epoch:
+                        entry = Entry(job.key, job.source, job.start, job.start + len(job.audio) / RATE,
+                                      text, job.final, job.revision)
+                        self.emit('transcript', epoch=job.epoch, entry=entry,
+                                  inference=time.monotonic() - started, backlog=len(self.mailbox),
+                                  latency=time.monotonic() - job.created)
+                    try:
+                        self.mailbox.acknowledge(job)
+                    except OSError as exc:
+                        self.emit('warning', message=f'Phrase decoded, but its temporary audio could not be removed: {exc}')
+                finally:
+                    with self.state_lock:
+                        self.decoding = False
         except Exception as exc:
             logging.exception('Transcription engine failed')
             self.emit('error', message=str(exc))
-            self.stop_event.set()
+            self.stop()
         finally:
-            self.stop_event.set()
+            self.stop()
             for thread in self.capture_threads:
                 thread.join()
+            try:
+                self.mailbox.preserve_pending()
+            except OSError as exc:
+                self.emit('error', message=f'Some pending audio could not be saved: {exc}. Free disk space and Resume before closing.')
             self.finished.set()
             self.emit('stopped')
 
-    def _capture(self, source, vad):
-        # WASAPI is COM, and COM apartments are per-thread.
-        with com_apartment():
-            self._capture_loop(source, vad)
-
-    def _capture_loop(self, source, vad):
-        import soundcard as sc
+    def _capture(self, source):
+        """Keep segmentation in the parent; restart native capture after any failure."""
         selection = self.settings.output_id if source == 'Computer' else self.settings.microphone_id
-        segmenter = SpeechSegmenter(source, self.epoch, self.submit, PROFILES[self.settings.profile][2])
-        def device():
-            if source == 'Computer':
-                speaker = sc.get_speaker(selection) if selection else sc.default_speaker()
-                if speaker is None:
-                    raise RuntimeError('The saved output device is no longer present. '
-                                       'Choose another output, or Follow Windows default.')
-                # A pinned endpoint that is not the one Windows plays to records pure
-                # silence forever, which is indistinguishable from a quiet meeting.
-                if selection:
-                    default = sc.default_speaker()
-                    if default is not None and default.id != speaker.id:
-                        self.emit('wrong_output', source=source, selected=speaker.name,
-                                  playing=default.name)
-                return sc.get_microphone(speaker.id, include_loopback=True)
-            return sc.get_microphone(selection) if selection else sc.default_microphone()
         while not self.stop_event.is_set():
+            segmenter = SpeechSegmenter(source, self.epoch, self.submit, PROFILES[self.settings.profile][2])
             try:
-                mic = device()
-                if mic is None:
-                    raise RuntimeError('No audio device is available.')
-                current_id = mic.id
-                self.note(source, device=mic.name, state='opening', error='')
-                self.emit('device', source=source, message=mic.name)
-                check_at = time.monotonic() + 1.
-                with open_recorder(mic, source, RATE) as recorder:
-                    self.note(source, state='capturing')
-                    self.emit('capture_ready', source=source, message=mic.name)
-                    while not self.stop_event.is_set():
-                        epoch_before = self.epoch
-                        with warnings.catch_warnings(record=True) as caught:
-                            warnings.simplefilter('always')
-                            data = recorder.record(numframes=FRAMES)
-                        if caught:
-                            self.emit('discontinuity', source=source, count=len(caught))
-                        if epoch_before != self.epoch or segmenter.epoch != self.epoch:
-                            segmenter = SpeechSegmenter(source, self.epoch, self.submit, PROFILES[self.settings.profile][2])
-                            vad = StreamingVAD()
-                            continue
-                        if not self.armed.is_set():
-                            if segmenter.key or segmenter.carry is not None:
-                                segmenter.flush()  # Finish the phrase that was in flight.
-                            self.note(source, state='idle')
-                            continue
-                        audio = np.asarray(data, dtype=np.float32).mean(axis=1)
-                        if not np.isfinite(audio).all():
-                            raise RuntimeError('The audio device returned invalid samples.')
-                        now = time.monotonic()
-                        start = self.time_offset + now - self.origin - len(audio) / RATE
-                        rms = float(np.sqrt(np.mean(audio ** 2)))
-                        self.emit('level', source=source, rms=rms)
-                        probability = vad.probability(audio)
-                        segmenter.feed(audio, max(0., start), probability)
-                        block_peak = float(np.max(np.abs(audio)))
-                        self.note(source, state='capturing', blocks_n=1, rms=rms,
-                                  peak=block_peak, peak_max=block_peak,
-                                  speech=probability, channels=int(np.ndim(data) > 1 and np.shape(data)[1] or 1),
-                                  utterance=bool(segmenter.key), buffered=segmenter.samples / RATE,
-                                  silence=segmenter.silence)
-                        if not selection and now >= check_at:
-                            check_at = now + 1.
-                            if device().id != current_id:
-                                segmenter.flush()
-                                vad = StreamingVAD()
-                                self.emit('warning', message=f'{source} device changed. Reconnecting…')
-                                break
-            except BufferError as exc:
-                self.emit('error', message=str(exc))
-                self.stop_event.set()
+                vad = StreamingVAD()
+                with CaptureProcess(source, selection, RATE, FRAMES) as capture:
+                    self._capture_loop(source, vad, segmenter, capture)
             except Exception as exc:
                 self.note(source, state='error', error=f'{type(exc).__name__}: {exc}', errors_n=1)
-                self.emit('capture_error', source=source, message=f'{source}: {exc} Retrying…')
+                self.emit('capture_error', source=source, message=f'{source}: {exc} Retrying?')
+            finally:
                 try:
-                    segmenter.flush()
-                except BufferError:
-                    self.stop_event.set()
-                if not self.stop_event.wait(1.):
+                    with self.state_lock:
+                        segmenter.flush()
+                except Exception as exc:
+                    self.emit('error', message=f'Cannot buffer pending audio: {exc}. Free disk space, then Resume.')
+                    self.stop()
+                with self.state_lock:
+                    self.flush_pending.discard(source)
+            if not self.stop_event.is_set():
+                self.stop_event.wait(1.)
+        self.note(source, state='stopped')
+
+    def _capture_loop(self, source, vad, segmenter, capture):
+        silence_seconds = 0.
+        device_name = source
+        audio_ready = False
+        while True:
+            with self.state_lock:
+                if self.stop_event.is_set() and source not in self.flush_pending:
+                    return
+                if self.stop_event.is_set() and time.monotonic() - self.stop_at >= .5:
+                    self.emit('warning', message=f'{source} did not finish its audio read. Keeping buffered speech and closing the device.')
+                    return
+            message = capture.receive(timeout=.1)
+            if message is None:
+                continue
+            kind = message.pop('type')
+            if kind in ('capture_error', 'device_changed'):
+                raise RuntimeError(message['message'])
+            if kind != 'audio':
+                if kind == 'capture_ready':
+                    device_name = message['message']
+                    self.note(source, state='opening', device=device_name, error='',
+                              digital_silence=0., last_block=0.)
+                    continue
+                self.emit(kind, source=source, **message)
+                continue
+            if message['discontinuities']:
+                self.emit('discontinuity', source=source, count=message['discontinuities'])
+            captured = message['captured']
+            data = np.asarray(message['data'], dtype=np.float32)
+            if not len(data):
+                continue
+            audio = data.mean(axis=1) if data.ndim == 2 else data
+            if audio.ndim != 1 or not np.isfinite(audio).all():
+                raise RuntimeError('The audio device returned invalid samples.')
+            if not audio_ready:
+                audio_ready = True
+                self.note(source, state='capturing', last_block=captured, error='')
+                self.emit('capture_ready', source=source, message=device_name)
+            with self.state_lock:
+                if segmenter.epoch != self.epoch:
+                    segmenter.reset(self.epoch)
                     vad = StreamingVAD()
-        try:
-            segmenter.flush()
-        except BufferError as exc:
-            self.emit('error', message=str(exc))
+                if captured < self.reset_at:
+                    continue
+                if not self.armed.is_set() and source not in self.flush_pending:
+                    self.note(source, state='idle', digital_silence=0., last_block=captured)
+                    silence_seconds = 0.
+                    continue
+                start = self.time_offset + captured - self.origin - len(audio) / RATE
+                rms = float(np.sqrt(np.mean(audio ** 2)))
+                self.emit('level', source=source, rms=rms)
+                probability = vad.probability(audio)
+                segmenter.feed(audio, max(0., start), probability)
+                block_peak = float(np.max(np.abs(audio)))
+                silence_seconds = silence_seconds + len(audio) / RATE if block_peak < 1e-4 else 0.
+                self.note(source, state='capturing', blocks_n=1, rms=rms,
+                          peak=block_peak, peak_max=block_peak, digital_silence=silence_seconds,
+                          last_block=captured, speech=probability,
+                          channels=data.shape[1] if data.ndim == 2 else 1,
+                          utterance=bool(segmenter.key), buffered=segmenter.samples / RATE,
+                          silence=segmenter.silence)
+                if not self.armed.is_set() and captured >= self.disarmed_at:
+                    segmenter.flush()
+                    self.flush_pending.discard(source)
+                    self.note(source, state='idle', digital_silence=0.)

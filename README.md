@@ -67,4 +67,30 @@ For NVIDIA acceleration, use a compatible installed NVIDIA driver and install `r
 
 **Verification**
 
-Verify by running the app against a real call. The development scaffolding used during the rebuild (benchmarks, synthetic-speech replays, and the pre-rebuild sources) has been removed from the repository. Current design decisions and upstream sources are in [RESEARCH.md](RESEARCH.md).
+Run the regression suite from the project directory:
+
+```powershell
+.\venv\Scripts\python.exe -m unittest discover -s tests -t . -v
+```
+
+The tests cover queue overload, CPU/GPU errors, stalled/crashed audio helpers, device reconnection, dictation completion, Clear/Undo, clipboard failures, exports, autosave retries, and GUI shutdown. They use temporary folders, synthetic audio, and hidden Tk windows. They do not change your settings, clipboard, or saved sessions.
+
+An optional real-hardware check accepts a synthetic speech WAV containing the words “meeting” and “project”:
+
+```powershell
+.\venv\Scripts\python.exe -m tests.smoke_runtime --wave C:\path\to\synthetic-speech.wav
+```
+
+This checks cached models on GPU (when available) and CPU, briefly reads both default audio devices in memory, tests capture shutdown/resume, and verifies native hotkey message delivery. It does not save the captured audio or print its transcript. Models must already be cached; this check runs offline. Current design decisions and upstream sources are in [RESEARCH.md](RESEARCH.md).
+
+**Reliability and recovery**
+
+Dictation waits until both capture sources have flushed and all decoding has finished before copying and clearing. While a burst is finishing, another hotkey press shows a waiting message. Clear, Pause, leaving dictation mode, and closing cancel the pending automatic copy. A capture or decoding failure keeps the text for manual review and retry.
+
+Native audio devices run in separate helper processes. A device that stops responding is restarted after eight seconds without a message; helper startup has a separate thirty-second allowance. Pause and Close can terminate an unresponsive device helper while retaining speech already buffered by the app. Disconnections can still leave gaps while the device is unavailable. The app reconnects when following Windows default, including between dictation bursts.
+
+Decoding errors get up to three attempts, with CPU fallback and model reload when needed. A persistently failing final phrase is saved for recovery while later phrases continue. **Retry failed phrases** retries this session’s failures; when paused, it resumes listening with the same mode and language. **Recover saved audio…** lets you select saved phrase files and writes a separate `Recovered_*.txt` and JSON report in `sessions/`, using their original language/settings on CPU. Recovery keeps the original audio files.
+
+Up to 64 queued audio jobs stay in memory. Additional final phrases go to `sessions/pending-audio/` instead of stopping capture; unnecessary queued previews are skipped under load. Successfully decoded overflow files are removed. Failed phrases and unfinished overflow files remain available for recovery after restarting. Clear invalidates and removes this session’s queued/failed audio; it does not remove unrelated saved sessions. This is a pending-audio buffer, not a continuous recording backup.
+
+Autosave retries temporary failures, and recent silence is checked separately for each source throughout the session. A disk-full condition that prevents audio buffering stops capture visibly and retains the affected audio in memory; closing then requires an explicit choice if that audio still cannot be saved. Free disk space and Resume to retry. No software can preserve uncaptured audio through device outages, or unsaved work through a power loss; use real meeting and long-duration testing on each target machine before relying on unattended transcription.
